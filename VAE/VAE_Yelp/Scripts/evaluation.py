@@ -1,0 +1,728 @@
+import numpy as np
+import torch
+import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.spatial import distance
+import calibration_Func
+from collections import defaultdict
+user_col = 'user_idx'
+item_col = 'business_idx'
+value_col = 'stars'
+timestamp = 'data'
+
+def dcg_at_k(scores, k):
+    """
+    Compute Discounted Cumulative Gain (DCG) at rank k.
+
+    DCG is a ranking quality metric that assigns higher importance
+    to relevant items appearing earlier in the recommendation list.
+
+    Parameters:
+        scores: List of relevance scores for items
+        k: Number of items to consider in the ranking
+    Returns:
+        float: DCG score at rank k
+    """
+    positions = np.arange(1, min(k, len(scores)) + 1)
+    return np.sum((2 ** np.array(scores) - 1) / np.log2(positions + 1))
+
+
+def ndcg_at_k(scores, k):
+    """
+            Calculate the Normalized Discounted Cumulative Gain (NDCG) at k.
+            Parameters:
+                scores: Predicted scores for different items proposed by recommedne systems
+                k: Number of items to consider
+            Returns:
+            float: NDCG score at rank k
+        """
+    sorted_scores = sorted(scores, reverse=True)
+    dcg = dcg_at_k(scores, k)
+    idcg = dcg_at_k(sorted_scores, k)
+    if idcg == 0:
+        return 0.0  # Avoid division by zero
+    return dcg / idcg
+
+
+def calculate_recall(recommended_items, interacted_items):
+    """
+        Calculate recall for recommended items compared to interacted items.
+
+        Recall measures the proportion of relevant items that are recommended.
+
+        Parameters:
+            recommended_items: List of recommended items
+            interacted_items: List of items the user has interacted with
+        Returns:
+            float: Recall score
+    """
+    # Calculate the number of true positives
+    true_positives = len(set(recommended_items) & set(interacted_items))
+    # Calculate the number of false negatives
+    false_negatives = len(set(interacted_items) - set(recommended_items))
+    # print(recommended_items)
+    # print(interacted_items)
+    # Calculate recall
+    recall = true_positives / (true_positives + false_negatives)
+    return recall
+
+
+def calculate_total_average_recall(interacted_items_test, predictions):
+    """
+           Calculate the average recall across all test users.
+
+           Parameters:
+               interacted_items_test: Dict mapping test user IDs to their interacted items
+               predictions: Dict mapping user IDs to recommended items
+           Returns:
+               float: Average recall across all test users
+       """
+    total_recall = []
+    # interacted_items_test= interacted_items(test_data,item_mapping)
+    for user_id in interacted_items_test.keys():
+        recommended_items = predictions.get(user_id, [])  # Get recommendations for the user
+        # Calculate recall for the user
+        recall = calculate_recall(recommended_items, interacted_items_test[user_id])
+        total_recall.append(recall)
+    # Calculate the average recall across all users
+    average_recall = np.mean(total_recall)
+
+    return average_recall
+
+
+
+
+def popularity_id(user_train, item_mapping):
+    """
+        Calculate the popularity of items based on their frequency in training data.
+
+        Parameters:
+            user_train: DataFrame containing user interaction data
+            item_mapping: Dict mapping movie IDs to titles
+        Returns:
+            dict: Dictionary mapping item titles to their normalized frequency
+        """
+    # Get the frequency of movieIds
+    frequency = user_train[item_col].value_counts(normalize=True)
+    # Create a dictionary mapping movieIds to titles
+    popularity = {}
+    for movie_id, count in frequency.items():
+        if movie_id in item_mapping:
+            title = item_mapping[movie_id]
+            popularity[title] = count
+    return popularity
+
+"""
+def novelty(list_recommendation, traning_data, item_mapping, top_k):
+    popular = popularity_id(traning_data, item_mapping)
+    # print(popular)
+    u = len(traning_data['userId'].unique())
+    n = top_k
+    mean_self_information = []
+    k = 0
+    for user_id in list_recommendation.keys():
+        self_information = 0
+        k += 1
+        for i in list_recommendation[user_id]:
+            if i in popular:
+                pop_i = popular[i]
+                if pop_i != 0:
+                    self_information += np.sum(-np.log2(pop_i / u))
+
+        mean_self_information.append(self_information / n)
+    novelty = sum(mean_self_information) / k
+    # return novelty, mean_self_information
+    return novelty
+"""
+
+"""ref : Zhou, T., Kuscsik, Z., Liu, J. G., Medo, M., Wakeling, J. R., & Zhang, Y. C. (2010).
+    Solving the apparent diversity-accuracy dilemma of recommender systems.
+    Proceedings of the National Academy of Sciences, 107(10), 4511-4515.  """
+
+# p(i|R)
+
+# 𝑝(𝑖|𝑅) ~ 𝑝(𝑖) |ℐ|⁄|𝑅| for 𝑖 ∈ 𝑅
+
+# 𝑛𝑜𝑣𝑒𝑙𝑡𝑦(𝑅) = −∑𝑝(𝑖|𝑅) log2 𝑝(𝑖)
+import math
+
+
+def p_i_R(p_i, J, R):
+    """
+    Calculate the probability of an item given a recommendation list.
+
+    Parameters:
+        p_i: Popularity of the item
+        J: Total number of items
+        R: Length of the recommendation list
+    Returns:
+        float: Probability of the item in the recommendation context
+    """
+    return p_i * J / R
+
+
+def novelty_R_total(list_recommendation, training_data, item_mapping):
+    """
+    Compute total novelty across all users based on item popularity.
+
+    Parameters:
+        list_recommendation: Dict mapping user IDs to recommended items
+        training_data: DataFrame containing training interaction data
+        item_mapping: Dict mapping movie IDs to titles
+    Returns:
+        float: Mean novelty score across all users
+    """
+    popular = popularity_id(training_data, item_mapping)
+    novelty_users = {}
+    total = []
+    for user_id in list_recommendation.keys():
+        nov_total = 0
+        R = list_recommendation[user_id]
+        for i in R:  # i is title of a movie
+            if i in popular:
+                pop_i = popular[i]
+                pir = p_i_R(pop_i, training_data.shape[1], len(R))
+                if pop_i != 0:
+                    nov_total += pir * np.log(pop_i)
+        novelty_users[user_id] = (-nov_total)
+        total.append(novelty_users[user_id])
+    return np.mean(total)
+
+
+def Diversity(recommendation_list, df):
+    """
+           Calculate the diversity of recommendations using Jensen-Shannon divergence.
+
+           Parameters:
+               recommendation_list: Dict mapping user IDs to recommended items
+               df: DataFrame containing genre features for items
+           Returns:
+               float: Average diversity across all users
+        """
+    diversity_user = {}
+    total_diversity = 0
+    title_genre_map = {}
+    for title in df['title'].unique():
+        df_temp = df[df['title'] == title].drop(['title'], axis=1).values.flatten().tolist()
+        title_genre_map[title] = df_temp
+
+    for user_id, movie_list in recommendation_list.items():
+        jsd_sum = 0
+        num_pairs = 0
+
+        for i in range(len(movie_list)):
+            for j in range(i + 1, len(movie_list)):
+                movie1 = movie_list[i]
+                movie2 = movie_list[j]
+
+                # Filter the DataFrame to get the data for the two movies
+                """movie1_data = df[df['title'] == str(movie1)].drop(['title'], axis=1).values.flatten().tolist()
+                movie2_data = df[df['title'] == str(movie2)].drop(['title'], axis=1).values.flatten().tolist()"""
+                movie1_data = title_genre_map.get(str(movie1), np.empty((0, 0)))
+                movie2_data = title_genre_map.get(str(movie2), np.empty((0, 0)))
+
+                if np.array(movie1_data).sum() > 0 and np.array(movie2_data).sum() > 0:
+                    # print(movie1_data)
+                    movie1_data = movie1_data / np.array(movie1_data).sum()
+                    movie2_data = movie2_data / np.array(movie2_data).sum()
+                    jsd_sum += distance.jensenshannon(movie1_data, movie2_data)
+                    num_pairs += 1
+        if num_pairs > 0:
+            diversity_user[user_id] = jsd_sum / num_pairs
+            total_diversity += diversity_user[user_id]
+    avg_diversity = total_diversity / len(recommendation_list)
+    # return diversity_user, avg_diversity
+    return avg_diversity
+
+
+def serendepity_group(user_group, test_user_item_dict, item_mapping, recommendations, genres_df):
+    """
+           Calculate serendipity for a group of users based on cosine similarity of genres.
+
+           Parameters:
+               user_group: List of user IDs
+               test_user_item_dict: Dict mapping user IDs to interacted items
+               item_mapping: Dict mapping movie IDs to titles
+               recommendations: Dict mapping user IDs to recommended items
+               genres_df: DataFrame containing genre features
+           Returns:
+               float: Mean serendipity score
+       """
+    serendepity = []
+    interacted_items_test = {}
+    # Preprocess genre data to map titles to genre vectors
+    title_genre_map = {}
+    for title in genres_df['title'].unique():
+        df_temp = genres_df[genres_df['title'] == title].drop(columns=['title'])
+        title_genre_map[title] = np.asarray(df_temp.values)
+
+    # Use this map to quickly access genre vectors in your loops
+
+    for u in user_group:
+        if u in test_user_item_dict:
+            interacted_items = test_user_item_dict[u]
+            interacted_items = [index for index in interacted_items if index in item_mapping]
+            interacted_items_test[u] = [item_mapping[item_id] for item_id in interacted_items]
+            R = len(recommendations[u])
+            H = len(interacted_items_test[u])
+            cosin_sim_sum = 0
+            for rec_item in recommendations[u]:
+
+                for interacted_item in interacted_items_test[u]:
+
+                    """df1 = genres_df[genres_df['title'] == str(rec_item)].drop(columns=['title'])
+                    df2 = genres_df[genres_df['title'] == str(interacted_item)].drop(columns=['title'])
+      
+                    matrix1 = np.asarray(df1.values)
+                    matrix2 = np.asarray(df2.values)"""
+                    matrix1 = title_genre_map.get(str(rec_item), np.empty((0, 0)))
+                    matrix2 = title_genre_map.get(str(interacted_item), np.empty((0, 0)))
+                    if matrix1.size > 0 and matrix2.size > 0:
+                        cosin_sim = cosine_similarity(matrix1, matrix2)
+                        cosin_sim_sum += (cosin_sim / R)
+            serendepity.append(cosin_sim_sum / H)
+    return (np.mean(serendepity))
+
+def PopularItems(popularity_lst):
+    """
+           Identify the most popular items (top 20%) based on training data.
+
+           Parameters:
+               user_train: DataFrame containing user interaction data
+               item_mapping: Dict mapping movie IDs to titles
+           Returns:
+               list: List of the most popular item titles
+       """
+    #popularity_lst = popularity_id(user_train, item_mapping)  # Include popularity of items in train data
+    # Sort items based on their popularity in descending order
+    sorted_popularity = dict(sorted(popularity_lst.items(), key=lambda item: item[1], reverse=True))
+    # Calculate the number of items to select (top 20%)
+    n = int(len(sorted_popularity) * 0.2)
+    # Select the top N items using slicing
+    popular_items = list(sorted_popularity.keys())[:n]
+    # for pareto
+    # return popular_items, sorted_popularity
+    return popular_items
+
+
+def type_of_user_total(item_mapping, popular_items, data,index_to_item_global):
+    """
+            Classify users based on their interaction with popular items.
+
+            Parameters:
+                item_mapping: Dict mapping movie IDs to titles
+                popular_items: List of popular item titles
+                ratings: DataFrame containing user ratings
+            Returns:
+                tuple: Lists of niche, blockbuster, diverse, and new users
+        """
+    niche_user = []
+    blockbuster = []
+    new = []
+    diverse = []
+    all_users = data.groupby('uid')['sid'].apply(list).to_dict()
+    #print(f"all_users: {all_users}")
+    for user_id in all_users:
+        size_profile = len(all_users[user_id])
+        numerized_items = all_users[user_id]
+        real_interacted_item_ids = [index_to_item_global[item_id] for item_id in numerized_items if
+                                    item_id in index_to_item_global]
+        interacted_items = [item_mapping[item_id] for item_id in real_interacted_item_ids if item_id in item_mapping]
+        if size_profile > 0:
+            y = len(set(interacted_items) & set(popular_items)) / size_profile
+            if y > 0.85:
+                # print("one blockbuster!")
+                blockbuster.append(user_id)
+            elif y < 0.5:
+                niche_user.append(user_id)
+            else:
+                diverse.append(user_id)
+        else:
+            new.append(user_id)
+
+    return niche_user, blockbuster, diverse, new
+
+def MRR(reco_items, test_user):
+    """
+        Calculate Mean Reciprocal Rank (MRR) for recommendations.
+
+        Parameters:
+            reco_items: Dict mapping user IDs to recommended items
+            test_user: Dict mapping user IDs to test interacted items
+        Returns:
+            float: Mean Reciprocal Rank score
+        """
+    rr_users = 0
+    for user in reco_items.keys():
+        rr = 0
+        for x in test_user[user]:
+            if x in reco_items[user]:
+                rr += 1 / (reco_items[user].index(x) + 1)
+        rr_users += rr / len(reco_items[user])
+    return rr_users / len(reco_items.keys())
+
+
+def popularity_id(user_train, item_mapping):
+    item_col = 'business_idx'
+    # Get the frequency of movieIds
+    frequency = user_train[item_col].value_counts(normalize=True)
+    # Create a dictionary mapping movieIds to titles
+    popularity = {}
+    for movie_id, count in frequency.items():
+        if movie_id in item_mapping:
+            title = item_mapping[movie_id]
+            popularity[title] = count
+
+    return popularity
+
+
+
+def PL(train_data, item_mapping, recommendations, users, model,popular,index_to_item_global):
+    """
+    Calculate Popularity Lift (PL) for recommendations.
+
+    Parameters:
+        train_data: DataFrame containing training interaction data
+        item_mapping: Dict mapping movie IDs to titles
+        recommendations: Dict mapping user IDs to recommended items
+        users: List of user IDs
+        model: Trained recommendation model
+    Returns:
+        float: Popularity Lift score
+    """
+    user_interacted_items = train_data.groupby('uid')['sid'].apply(list).to_dict()  ########## training_data
+    interacted_items = {}
+    for u in user_interacted_items: # u is an index
+        numerized_items = user_interacted_items[u]
+        real_interacted_item_ids  = [index_to_item_global[item_id] for item_id in numerized_items if item_id in index_to_item_global]
+        interacted_items[u] = [item_mapping[item_id] for item_id in real_interacted_item_ids if item_id in item_mapping]
+    gap = []
+    history = []
+    model.eval()  # Set the model to evaluation mode
+    with torch.no_grad():
+        for u in users:
+            if u not in recommendations:
+                continue
+            x = sum(popular.get(rec, 0) for rec in recommendations[u])  # recommendations
+            gap.append(x / len(recommendations[u]))
+            if u in interacted_items:
+                y = sum(popular.get(prof, 0) for prof in interacted_items[u])
+                history.append(y / len(interacted_items[u]))
+        GAP_Q_G = np.mean(gap)
+        GAP_P_G = np.mean(history)
+        PL = (GAP_Q_G - GAP_P_G) / GAP_P_G
+
+    return PL
+
+
+def categories(train_data,extra_data,item_mapping):
+    """
+       Categorize items into popular (I1) and less popular (I2) based on training data.
+
+       Parameters:
+           train_data: DataFrame containing training interaction data
+           item_mapping: Dict mapping movie IDs to titles
+       Returns:
+           dict: Mapping of item titles to categories (I1 or I2)
+       """
+    train_data=pd.concat([train_data,extra_data],axis=0,ignore_index=True)
+    users=len(train_data[user_col].unique())
+    #print(train_data.columns)
+    category_mapping = {}
+    items = train_data[item_col].tolist()
+    popular_list=popularity_id(train_data, item_mapping)
+    most_popular = PopularItems(popular_list)
+    for movie_id in items:
+        if movie_id in item_mapping:
+            title = item_mapping[movie_id]
+            if title in most_popular:
+                category_mapping[title] = "I1"
+            else:
+                category_mapping[title] = "I2"
+    return category_mapping, popular_list, users
+
+def catalog_coverage(predicted: list, catalog: list) -> float:
+  """
+  Computes the catalog coverage for k lists of recommendations
+  Parameters
+  ----------
+  predicted : a list of lists
+      Ordered predictions
+      example: [['X', 'Y', 'Z'], ['X', 'Y', 'Z']]
+  catalog: list
+      A list of all unique items in the training data
+      example: ['A', 'B', 'C', 'X', 'Y', Z]
+  k: integer
+      The number of observed recommendation lists
+      which randomly choosed in our offline setup
+  Returns
+  ----------
+  catalog_coverage:
+      The catalog coverage of the recommendations as a percent rounded to 2 decimal places
+      or as a fraction rounded to 4 decimal places
+  ----------
+  Metric Defintion:
+  Ge, M., Delgado-Battenfeld, C., & Jannach, D. (2010, September).
+  Beyond accuracy: evaluating recommender systems by coverage and serendipity.
+  In Proceedings of the fourth ACM conference on Recommender systems (pp. 257-260). ACM.
+  """
+  predicted_flattened = [p for sublist in predicted for p in sublist]
+  L_predictions = len(set(predicted_flattened)) # remove duplicates
+  # output: precent (%)
+  #catalog_coverage = round(L_predictions / (len(catalog) * 1.0) * 100, 2)
+  # output: fraction (%)
+  catalog_coverage = round(L_predictions / (len(catalog) * 1.0) , 4)
+  return catalog_coverage
+
+def PL_items(train_data, item_mapping,recommendations, users, model, category_mapping,index_to_item_global,popular):
+    """
+       Calculate Popularity Lift (PL) for each item category.
+
+       Parameters:
+           train_data: DataFrame containing training interaction data
+           item_mapping: Dict mapping movie IDs to titles
+           recommendations: Dict mapping user IDs to recommended items
+           users: List of user IDs
+           model: Trained recommendation model
+           category_mapping: Dict mapping items to categories
+       Returns:
+           dict: PL scores for each category
+       """
+    user_interacted_items = train_data.groupby('uid')['sid'].apply(list).to_dict()  ########## training_data
+    interacted_items = {}
+    for u in user_interacted_items:  # u is an index
+        numerized_items = user_interacted_items[u]
+        real_interacted_item_ids = [index_to_item_global[item_id] for item_id in numerized_items if
+                                    item_id in index_to_item_global]
+        interacted_items[u] = [item_mapping[item_id] for item_id in real_interacted_item_ids if item_id in item_mapping]
+    categories = {cat: [] for cat in set(category_mapping.values())}
+    for item, cat in category_mapping.items():
+        categories[cat].append(item)
+    PL_results = {}
+    model.eval()
+    with torch.no_grad():
+        for category, items_in_category in categories.items():
+            gap=[]
+            history=[]
+            for u in users:
+                if u not in recommendations:
+                    continue
+                category_recommendations=[rec for rec in recommendations[u] if rec in items_in_category]
+                category_interacted = [
+                    item for item in interacted_items.get(u, []) if item in items_in_category
+                ]
+                #print(f"User {u}: category_interacted: {category_interacted}")
+                #print(f"User {u}: category_recommendations: {category_recommendations}")
+                if not category_recommendations or not category_interacted:
+                    #print(f"No category_interacted or category_recommendations for category {category} and user {u}. Skipping.")
+                    continue
+                #print("There is category mapping and category_interacted")
+                x = sum(popular.get(rec, 0) for rec in category_recommendations)
+                gap.append(x / len(category_recommendations))
+                # Calculate GAP_P_G for user history in this category
+                y = sum(popular.get(item, 0) for item in category_interacted)
+                history.append(y / len(category_interacted))
+            # Calculate PL for this category
+            GAP_Q_G = np.mean(gap) if gap else 0
+            GAP_P_G = np.mean(history) if history else 0
+            PL = (GAP_Q_G - GAP_P_G) / GAP_P_G if GAP_P_G != 0 else 0
+            PL_results[category] = PL
+        return PL_results
+
+
+
+def valid_distr_extraction(category_mapping,recommendations,interacted_items):
+    """
+        Extracts and computes valid distributions for interacted items and recommendations.
+
+        Parameters:
+        - category_mapping: A dictionary mapping items to their categories.
+        - recommendations: A dictionary mapping user IDs to recommended items.
+        - interacted_items: A dictionary mapping user IDs to interacted items.
+        - calibration_func: A class or object with a method `compute_genre_distr` to compute distributions.
+
+        Returns:
+        - valid_interacted: A dictionary of genre distributions for interacted items.
+        - valid_reco_distr: A dictionary of genre distributions for recommendations.
+    """
+    categories = {cat: [] for cat in set(category_mapping.values())}
+    for item, cat in category_mapping.items():
+        categories[cat].append(item)
+    valid_interacted = defaultdict(dict)
+    for user_id in interacted_items:
+        for category, items_in_category in categories.items():
+            interacted_items_train = [item for item in interacted_items[user_id] if item in items_in_category]
+            if interacted_items_train:
+                valid_interacted[category][user_id] = calibration_Func.compute_genre_distr(interacted_items_train)
+    # valid reco_dist
+    valid_reco_distr = defaultdict(dict)
+    for user_id in recommendations:
+        for category, items_in_category in categories.items():
+            valid_reco = [item for item in recommendations[user_id] if item in items_in_category]
+            if valid_reco:  # Ensure there are items to process
+             valid_reco_distr[category][user_id] = calibration_Func.compute_genre_distr(valid_reco)
+    return valid_interacted,valid_reco_distr
+
+
+def calculate_KLD_items(recommendations,reco_distr,interacted_distr):
+    """
+    Calculate Kullback-Leibler Divergence (KLD) for item categories.
+
+    Parameters:
+        recommendations: Dict mapping user IDs to recommended items
+        reco_distr: Dict of genre distributions for recommendations
+        interacted_distr: Dict of genre distributions for interacted items
+    Returns:
+        dict: KLD scores for each category
+    """
+
+    kld_results_category = {}
+    for category in reco_distr:
+        kld_category = []
+        for user_id in recommendations:
+            category_distr_interacted = interacted_distr.get(category, {}).get(user_id, None)
+            category_distr_reco = reco_distr.get(category, {}).get(user_id, None)
+            if not category_distr_interacted or not category_distr_reco:
+                #print(f"No category_interacted or category_distr for category {category} and user {user_id}. Skipping.")
+                continue
+            kl_divergence= calibration_Func.compute_kl_divergence(category_distr_interacted, category_distr_reco)
+            #print(f"KL Divergence for User {user_id}, Category {category}: {kl_divergence}")
+            if kl_divergence is not None:
+                kld_category.append(kl_divergence)
+            # Compute mean KLD for the category
+        if kld_category:
+            kld_results_category[category] = np.mean(kld_category)
+        else:
+            kld_results_category[category] = None  # Handle empty results for the category
+
+    return kld_results_category
+
+def calculate_ndcg_items(category_mapping,recommendations,interacted_items,top_k):
+    """
+        Calculate NDCG for each item category.
+
+        Parameters:
+            category_mapping: Dict mapping items to categories
+            recommendations: Dict mapping user IDs to recommended items
+            interacted_items: Dict mapping user IDs to interacted items
+            top_k: Number of items to consider
+        Returns:
+            dict: NDCG scores for each category
+        """
+
+    categories = {cat: [] for cat in set(category_mapping.values())}
+    for item, cat in category_mapping.items():
+        categories[cat].append(item)
+
+    ndcg_results_category = {}
+    for category, items_in_category in categories.items():
+        #print(f"category: {category}")
+        #print(f"items_in_category: {items_in_category}")
+        ndcg_users = []
+        for u in recommendations:
+            category_recommendations = [rec for rec in recommendations[u] if rec in items_in_category]
+
+            category_interacted = [
+                item for item in interacted_items.get(u, []) if item in items_in_category
+            ]
+            #print(f"User {u}: category_recommendations for {category}: {category_recommendations}")
+            #print(f"User {u}: category_interacted for {category}: {category_interacted}")
+
+            if not category_recommendations or not category_interacted:
+                #print(f"No recommendations or interactions for category {category} and user {u}. Skipping.")
+                continue
+            if category_recommendations and category_interacted:
+                common_items = set(category_recommendations).intersection(category_interacted)
+                relevance_scores = [1 if i in common_items else 0 for i in category_recommendations]
+                ndcg_normal = ndcg_at_k(relevance_scores[:top_k], top_k)
+                ndcg_users.append(ndcg_normal)
+
+        ndcg_results_category[category] = np.mean(ndcg_users)
+    return ndcg_results_category
+
+
+def novelty(list_recommendation,popular, u, k):
+    """
+    Computes the novelty for a list of recommended items for all users
+    Parameters
+    ----------
+    list_recommendation : a dict of recommedned items for all users
+        Ordered predictions
+        example: {1:['X', 'Y', 'Z'],2:['X', 'Y', 'Z']}
+
+    u: integer
+        The number of users in the training data
+    k: integer
+        The length of recommended lists per user
+    Returns
+    ----------
+    novelty:
+        The novelty of the recommendations in system level
+    mean_self_information:
+        The novelty of the recommendations in recommended top-N list level
+    ----------
+      Metric Defintion:
+    Zhou, T., Kuscsik, Z., Liu, J. G., Medo, M., Wakeling, J. R., & Zhang, Y. C. (2010).
+    Solving the apparent diversity-accuracy dilemma of recommender systems.
+    Proceedings of the National Academy of Sciences, 107(10), 4511-4515.
+    """
+    """popular: dictionary
+        A dictionary of all items alongside of its occurrences counter in the training data
+        example: {1198: 893, 1270: 876, 593: 876, 2762: 867}"""
+
+
+    mean_self_information = []
+    num_users_in_rec = len(list_recommendation)
+    for user_id in list_recommendation.keys():
+        self_information = 0
+        for item in list_recommendation[user_id]:
+            if item in popular.keys():
+                item_popularity = popular[item] / u
+                if item_popularity != 0:
+                    item_novelty_value= np.sum(-np.log2(item_popularity))
+            else:
+                item_novelty_value = 0
+            self_information += item_novelty_value
+        novelty_score = self_information / k
+        mean_self_information.append(novelty_score)
+    novelty = sum(mean_self_information) / num_users_in_rec
+    #return novelty, mean_self_information
+    return novelty
+
+
+def DPF(recommendations, category_mapping):
+    """
+            Parameters:
+                recommendations: Dict mapping user IDs to recommended items
+                category_mapping: Dict mapping items to categories (I1 or I2)
+            Returns:
+                tuple: DPF, normalized DPF, exposure for I1, exposure for I2, normalized exposure for I1 and I2
+            """
+    categories = {cat: [] for cat in set(category_mapping.values())}
+    for item, cat in category_mapping.items():
+        categories[cat].append(item)
+    len_I1= len(categories['I1'])
+    #print("len I1: ",len_I1)
+    len_I2 = len(categories['I2'])
+    recommended_I1=set()
+    recommended_I2=set()
+    for u in recommendations:
+        for item in recommendations[u]:
+            if item in category_mapping:
+                x=category_mapping[item]
+                if x=="I1":
+                    recommended_I1.add(item)
+                else:
+                    recommended_I2.add(item)
+    #
+    exposure_I1 = len(recommended_I1) / len_I1 if len_I1 > 0 else 0
+    exposure_I2 = len(recommended_I2) / len_I2 if len_I2 > 0 else 0
+    dpf = exposure_I1 - exposure_I2
+    total_items=len(recommended_I1) +len(recommended_I2)
+    normalized_exposure_1 = len(recommended_I1) / total_items if total_items > 0 else 0 # based on the paper results
+    normalized_exposure_2 = len(recommended_I2) / total_items if total_items > 0 else 0
+    normalized_dpf = normalized_exposure_1 - normalized_exposure_2
+    return dpf,normalized_dpf, exposure_I1, exposure_I2 ,normalized_exposure_1, normalized_exposure_2  #  exposure_I1, exposure_I2 could be considered as I1 coverage and I2 coverage
+
+
+

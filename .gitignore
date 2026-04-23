@@ -1,0 +1,31 @@
+# Ignore all .log files
+*.log
+*.git
+*.xml
+*.iml
+*.gz
+*.fls
+*.nav
+*.aux
+*.blg
+*.bbl
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.brf
+*.fls
+*.fdb_latexmk
+*.log
+*.lof
+*.lot
+*.out
+*.toc
+*.idea
+main.fdb_latexmk
+*.out
+*.snm
+*.toc
+
+# Ignore all .env files
+*.env
